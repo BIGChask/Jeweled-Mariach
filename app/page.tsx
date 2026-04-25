@@ -16,6 +16,7 @@ interface TileState {
   y: number;
   isMatched: boolean;
   isNew?: boolean;
+  power?: 'bomb' | 'color' | 'cross';
 }
 
 const uuid = () => Math.random().toString(36).substr(2, 9);
@@ -24,13 +25,90 @@ function getRandomType(): TokenType {
   return TOKEN_TYPES[Math.floor(Math.random() * TOKEN_TYPES.length)];
 }
 
+const getMatches = (currentBoard: TileState[]) => {
+  let matchedIds = new Set<string>();
+  let matchGroups: Set<string>[] = [];
+  const getTile = (x: number, y: number) => currentBoard.find(t => t.x === x && t.y === y && !t.isMatched);
+
+  // Horizontal
+  for (let y = 0; y < GRID_SIZE; y++) {
+    let x = 0;
+    while (x < GRID_SIZE - 2) {
+      let t1 = getTile(x, y);
+      if (!t1) { x++; continue; }
+      let matchLength = 1;
+      while (x + matchLength < GRID_SIZE) {
+        let tNext = getTile(x + matchLength, y);
+        if (tNext && tNext.type === t1.type) matchLength++;
+        else break;
+      }
+      if (matchLength >= 3) {
+        let group = new Set<string>();
+        for (let i = 0; i < matchLength; i++) {
+          let t = getTile(x + i, y)!;
+          matchedIds.add(t.id);
+          group.add(t.id);
+        }
+        matchGroups.push(group);
+      }
+      x += matchLength;
+    }
+  }
+
+  // Vertical
+  for (let x = 0; x < GRID_SIZE; x++) {
+    let y = 0;
+    while (y < GRID_SIZE - 2) {
+      let t1 = getTile(x, y);
+      if (!t1) { y++; continue; }
+      let matchLength = 1;
+      while (y + matchLength < GRID_SIZE) {
+        let tNext = getTile(x, y + matchLength);
+        if (tNext && tNext.type === t1.type) matchLength++;
+        else break;
+      }
+      if (matchLength >= 3) {
+        let group = new Set<string>();
+        for (let i = 0; i < matchLength; i++) {
+          let t = getTile(x, y + i)!;
+          matchedIds.add(t.id);
+          group.add(t.id);
+        }
+        matchGroups.push(group);
+      }
+      y += matchLength;
+    }
+  }
+
+  // Merge intersecting groups
+  let mergedGroups: Set<string>[] = [];
+  for (let group of matchGroups) {
+    let merged = false;
+    for (let mGroup of mergedGroups) {
+      let intersection = new Set([...group].filter(x => mGroup.has(x)));
+      if (intersection.size > 0) {
+        group.forEach(id => mGroup.add(id));
+        merged = true;
+        break;
+      }
+    }
+    if (!merged) {
+      mergedGroups.push(new Set(group));
+    }
+  }
+
+  return { matchedIds: Array.from(matchedIds), matchGroups: mergedGroups };
+};
+
 export default function MariachiMatch() {
   const [gameState, setGameState] = useState<'menu' | 'playing' | 'gameover'>('menu');
   const [gameMode, setGameMode] = useState<'classic' | 'time_attack' | 'zen'>('classic');
   const [timeLeft, setTimeLeft] = useState(60);
 
   const [board, setBoard] = useState<TileState[]>([]);
+  const [particles, setParticles] = useState<{id: string, x: number, y: number, color: string}[]>([]);
   const [selected, setSelected] = useState<{ x: number; y: number } | null>(null);
+
   const [isProcessing, setIsProcessing] = useState(true);
   const [score, setScore] = useState(0);
   const [combo, setCombo] = useState(1);
@@ -96,74 +174,132 @@ export default function MariachiMatch() {
     setGameState('playing');
   };
 
-  const getMatchedTiles = (currentBoard: TileState[]) => {
-    let matches = new Set<string>();
-    const getTile = (x: number, y: number) => currentBoard.find(t => t.x === x && t.y === y && !t.isMatched);
-
-    // Check rows
-    for (let y = 0; y < GRID_SIZE; y++) {
-      for (let x = 0; x < GRID_SIZE - 2; x++) {
-        let tile1 = getTile(x, y);
-        let tile2 = getTile(x + 1, y);
-        let tile3 = getTile(x + 2, y);
-
-        if (tile1 && tile2 && tile3 && tile1.type === tile2.type && tile1.type === tile3.type) {
-          matches.add(tile1.id);
-          matches.add(tile2.id);
-          matches.add(tile3.id);
-          let curX = x + 3;
-          let nextTile = getTile(curX, y);
-          while (nextTile && nextTile.type === tile1.type) {
-            matches.add(nextTile.id);
-            curX++;
-            nextTile = getTile(curX, y);
-          }
-        }
-      }
-    }
-
-    // Check columns
-    for (let x = 0; x < GRID_SIZE; x++) {
-      for (let y = 0; y < GRID_SIZE - 2; y++) {
-        let tile1 = getTile(x, y);
-        let tile2 = getTile(x, y + 1);
-        let tile3 = getTile(x, y + 2);
-
-        if (tile1 && tile2 && tile3 && tile1.type === tile2.type && tile1.type === tile3.type) {
-          matches.add(tile1.id);
-          matches.add(tile2.id);
-          matches.add(tile3.id);
-          let curY = y + 3;
-          let nextTile = getTile(x, curY);
-          while (nextTile && nextTile.type === tile1.type) {
-            matches.add(nextTile.id);
-            curY++;
-            nextTile = getTile(x, curY);
-          }
-        }
-      }
-    }
-    return Array.from(matches);
-  };
-
-  const processMatches = async (currentBoard: TileState[], currentCombo: number) => {
+  const processMatches = async (currentBoard: TileState[], currentCombo: number, swapInfo?: {id1: string, id2: string}, explicitDestruction?: string[]) => {
     setIsProcessing(true);
-    const matchedIds = getMatchedTiles(currentBoard);
+    let matchedIdsArr: string[] = [];
+    let matchGroups: Set<string>[] = [];
+    let newPowersToSpawn: any[] = [];
+    
+    if (explicitDestruction) {
+       matchedIdsArr = explicitDestruction;
+    } else {
+       const res = getMatches(currentBoard);
+       matchedIdsArr = res.matchedIds;
+       matchGroups = res.matchGroups;
+    }
 
-    if (matchedIds.length === 0) {
+    if (matchedIdsArr.length === 0) {
       setIsProcessing(false);
       setCombo(1);
       return;
     }
 
+    let toDestroy = new Set<string>(matchedIdsArr);
+    let queue = Array.from(toDestroy);
+
+    if (!explicitDestruction) {
+        for (let group of matchGroups) {
+            let size = group.size;
+            let powerTargetId: string | null = null;
+            if (swapInfo) {
+               let swappedId = group.has(swapInfo.id1) ? swapInfo.id1 : group.has(swapInfo.id2) ? swapInfo.id2 : null;
+               if (swappedId) powerTargetId = swappedId;
+            }
+            if (!powerTargetId) {
+               powerTargetId = Array.from(group)[0];
+            }
+            let targetObj = currentBoard.find(t => t.id === powerTargetId);
+            if (!targetObj) continue;
+
+            if (size === 4) {
+                newPowersToSpawn.push({ id: powerTargetId, type: targetObj.type, power: 'bomb' });
+                toDestroy.delete(powerTargetId);
+                queue = queue.filter(q => q !== powerTargetId);
+            } else if (size === 5) {
+                newPowersToSpawn.push({ id: powerTargetId, type: targetObj.type, power: 'color' });
+                toDestroy.delete(powerTargetId);
+                queue = queue.filter(q => q !== powerTargetId);
+            } else if (size >= 6) {
+                newPowersToSpawn.push({ id: powerTargetId, type: targetObj.type, power: 'cross' });
+                toDestroy.delete(powerTargetId);
+                queue = queue.filter(q => q !== powerTargetId);
+            }
+        }
+    }
+
+    // Now propagate explosions
+    while(queue.length > 0) {
+        let currentId = queue.shift()!;
+        let tile = currentBoard.find(t => t.id === currentId);
+        if (!tile) continue;
+
+        if (tile.power === 'bomb') {
+           for(let dx=-1; dx<=1; dx++) {
+             for(let dy=-1; dy<=1; dy++) {
+                let neighbor = currentBoard.find(t => t.x === tile!.x + dx && t.y === tile!.y + dy);
+                if (neighbor && !toDestroy.has(neighbor.id) && !newPowersToSpawn.find(p => p.id === neighbor.id)) {
+                    toDestroy.add(neighbor.id);
+                    queue.push(neighbor.id);
+                }
+             }
+           }
+        } else if (tile.power === 'cross') {
+           for(let i=0; i<GRID_SIZE; i++) {
+               let rId = currentBoard.find(t => t.x === i && t.y === tile!.y)?.id;
+               let cId = currentBoard.find(t => t.x === tile!.x && t.y === i)?.id;
+               if (rId && !toDestroy.has(rId) && !newPowersToSpawn.find(p => p.id === rId)) { toDestroy.add(rId); queue.push(rId); }
+               if (cId && !toDestroy.has(cId) && !newPowersToSpawn.find(p => p.id === cId)) { toDestroy.add(cId); queue.push(cId); }
+           }
+        } else if (tile.power === 'color') {
+            let randomType = TOKEN_TYPES[Math.floor(Math.random()*TOKEN_TYPES.length)];
+            let targets = currentBoard.filter(t => t.type === randomType);
+            for (let target of targets) {
+                if (!toDestroy.has(target.id) && !newPowersToSpawn.find(p => p.id === target.id)) {
+                    toDestroy.add(target.id);
+                    queue.push(target.id);
+                }
+            }
+        }
+    }
+
+    let finalDestroyList = Array.from(toDestroy);
     playMatchSound(currentCombo);
 
-    let boardWithMatches = currentBoard.map(t => 
-      matchedIds.includes(t.id) ? { ...t, isMatched: true } : t
-    );
+    let boardWithMatches = currentBoard.map(t => {
+      let spawn = newPowersToSpawn.find(p => p.id === t.id);
+      if (spawn) {
+         return { ...t, power: spawn.power, isMatched: false };
+      }
+      if (finalDestroyList.includes(t.id)) {
+         return { ...t, isMatched: true };
+      }
+      return t;
+    });
+
     setBoard(boardWithMatches);
-    
-    setScore(s => s + (matchedIds.length * 10 * currentCombo));
+    setScore(s => s + (finalDestroyList.length * 10 * currentCombo));
+
+    if (currentCombo > 1 && finalDestroyList.length > 0) {
+        let newParticles: any[] = [];
+        for (let id of finalDestroyList) {
+            const t = currentBoard.find(x => x.id === id);
+            if (t) {
+                for (let i=0; i<3; i++) {
+                    newParticles.push({
+                        id: uuid(),
+                        x: t.x * tileSize + tileSize / 2,
+                        y: t.y * tileSize + tileSize / 2,
+                        color: ['#e91e63','#ff9800','#00bcd4','#8bc34a','#ffeb3b'][Math.floor(Math.random()*5)]
+                    });
+                }
+            }
+        }
+        setParticles(prev => [...prev, ...newParticles]);
+        setTimeout(() => {
+            setParticles(prev => prev.filter(p => !newParticles.find(n => n.id === p.id)));
+        }, 1000);
+    }
+
 
     // Wait for disappear animation
     await new Promise(res => setTimeout(res, 300));
@@ -202,10 +338,9 @@ export default function MariachiMatch() {
     const cleanedBoard = nextBoard.map(t => ({ ...t, isNew: false }));
     
     // Continue processing if there are new cascades
-    // Note: We need to update state first to trigger UI, but we can instantly check logic again.
     setBoard(cleanedBoard);
-    const futureMatches = getMatchedTiles(cleanedBoard);
-    if(futureMatches.length > 0) {
+    const futureMatches = getMatches(cleanedBoard);
+    if(futureMatches.matchedIds.length > 0) {
         await new Promise(res => setTimeout(res, 100)); // slight pause before cascade pop
         processMatches(cleanedBoard, currentCombo + 1);
     } else {
@@ -237,14 +372,30 @@ export default function MariachiMatch() {
     });
 
     playSwapSound();
-    setBoard(tempBoard);
     
+    let explicitDestroy: string[] = [];
+    if (t1.power === 'color') {
+        explicitDestroy.push(t1.id);
+        tempBoard.filter(t => t.type === t2.type).forEach(t => explicitDestroy.push(t.id));
+    } else if (t2.power === 'color') {
+        explicitDestroy.push(t2.id);
+        tempBoard.filter(t => t.type === t1.type).forEach(t => explicitDestroy.push(t.id));
+    }
+
+    if (explicitDestroy.length > 0) {
+        setBoard(tempBoard);
+        await new Promise(res => setTimeout(res, 250)); // let swap finish
+        processMatches(tempBoard, 1, {id1: t1.id, id2: t2.id}, explicitDestroy);
+        return;
+    }
+
+    setBoard(tempBoard);
     await new Promise(res => setTimeout(res, 250));
 
-    const matchedIds = getMatchedTiles(tempBoard);
+    const matchedInfo = getMatches(tempBoard);
     
-    if (matchedIds.length > 0) {
-      processMatches(tempBoard, 1);
+    if (matchedInfo.matchedIds.length > 0) {
+      processMatches(tempBoard, 1, {id1: t1.id, id2: t2.id});
     } else {
       // Swap back
       playErrorSound();
@@ -422,6 +573,23 @@ export default function MariachiMatch() {
                 className="absolute inset-0 z-10"
               >
               <AnimatePresence>
+                 {particles.map(p => (
+                     <motion.div 
+                        key={p.id}
+                        initial={{ x: p.x, y: p.y, scale: 1, opacity: 1 }}
+                        animate={{ 
+                           x: p.x + (Math.random() - 0.5) * 150, 
+                           y: p.y + (Math.random() - 0.5) * 150, 
+                           scale: 0, 
+                           opacity: 0,
+                           rotate: Math.random() * 360
+                        }}
+                        transition={{ duration: 0.8, ease: "easeOut" }}
+                        className="absolute w-3 h-3 rounded-full pointer-events-none z-50 border border-white/50"
+                        style={{ backgroundColor: p.color }}
+                     />
+                 ))}
+                 
                 {board.map((tile) => (
                   <motion.div
                     key={tile.id}
@@ -431,25 +599,25 @@ export default function MariachiMatch() {
                       x: tile.x * tileSize, 
                       y: tile.y * tileSize,
                       opacity: tile.isMatched ? 0 : 1,
-                      scale: tile.isMatched ? 0 : (selected?.x === tile.x && selected?.y === tile.y ? 1.05 : 1),
+                      scale: tile.isMatched ? 1.3 : (selected?.x === tile.x && selected?.y === tile.y ? 1.05 : 1),
                     }}
                     exit={{ scale: 0, opacity: 0 }}
                     transition={{ 
                       type: 'spring', 
                       stiffness: 400, 
                       damping: 30,
-                      opacity: { duration: tile.isMatched ? 0.2 : 0.1 },
-                      scale: { duration: tile.isMatched ? 0.2 : 0.1 }
+                      opacity: { duration: tile.isMatched ? 0.3 : 0.1 },
+                      scale: { duration: tile.isMatched ? 0.3 : 0.1 }
                     }}
                     className="absolute p-0.5"
                     style={{ 
                       width: tileSize, 
                       height: tileSize,
-                      zIndex: tile.isMatched ? 0 : (selected?.x === tile.x && selected?.y === tile.y ? 20 : 10)
+                      zIndex: tile.isMatched ? 30 : (selected?.x === tile.x && selected?.y === tile.y ? 20 : 10)
                     }}
                   >
                     <div 
-                      className="w-full h-full relative cursor-pointer group active:scale-95 transition-transform"
+                      className={`w-full h-full relative cursor-pointer group active:scale-95 transition-transform`}
                       onClick={(e) => {
                           e.preventDefault();
                           handleTileClick(tile.x, tile.y)
@@ -458,7 +626,27 @@ export default function MariachiMatch() {
                           handleTileClick(tile.x, tile.y)
                       }}
                     >
-                      <TokenIcon type={tile.type} className="w-full h-full drop-shadow-[0_4px_4px_rgba(0,0,0,0.5)] group-hover:brightness-110 transition-all filter" />
+                      <TokenIcon type={tile.type} className={`w-full h-full drop-shadow-[0_4px_4px_rgba(0,0,0,0.5)] group-hover:brightness-110 transition-all filter ${tile.power === 'color' ? 'brightness-[1.5] saturate-[2]' : ''} ${tile.isMatched ? 'brightness-[2] saturate-[2]' : ''}`} />
+                      
+                      {tile.isMatched && (
+                         <div className="absolute inset-0 m-auto w-full h-full bg-white rounded-lg opacity-50 pointer-events-none mix-blend-overlay" />
+                      )}
+
+                      {tile.power === 'bomb' && (
+                         <div className="absolute inset-0 m-auto w-1/2 h-1/2 bg-red-500 rounded-full animate-ping opacity-75 pointer-events-none" />
+                      )}
+                      
+                      {tile.power === 'color' && (
+                         <div className="absolute inset-0 m-auto w-[85%] h-[85%] rounded-full animate-spin border-4 border-white border-dashed drop-shadow-[0_0_8px_rgba(255,255,255,1)] pointer-events-none mix-blend-overlay" />
+                      )}
+                      
+                      {tile.power === 'cross' && (
+                         <>
+                           <div className="absolute inset-0 m-auto w-[120%] h-[6px] bg-[#00ffcc] shadow-[0_0_12px_#00ffcc] pointer-events-none mix-blend-screen opacity-80" />
+                           <div className="absolute inset-0 m-auto h-[120%] w-[6px] bg-[#00ffcc] shadow-[0_0_12px_#00ffcc] pointer-events-none mix-blend-screen opacity-80" />
+                         </>
+                      )}
+
                        {selected?.x === tile.x && selected?.y === tile.y && (
                           <div className="absolute inset-0 border-4 border-yellow-300 rounded shadow-[0_0_15px_rgba(253,224,71,0.8),inset_0_0_10px_rgba(253,224,71,0.5)] animate-pulse pointer-events-none" />
                        )}
